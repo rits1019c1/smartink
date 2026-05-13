@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Smart Ink Editor - Multi-Stroke</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+        body { font-family: 'Inter', sans-serif; touch-action: none; background: #f8fafc; overflow: hidden; }
+        canvas { touch-action: none; cursor: crosshair; display: block; }
+        .ui-panel { background: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); }
+    </style>
+</head>
+<body class="flex flex-col h-screen">
+
+    <div class="ui-panel border-b border-slate-200 p-3 z-10 shadow-sm">
+        <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-slate-900 rounded-xl flex items-center justify-center shadow-lg">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="text-sm font-bold text-slate-800 leading-tight">Smart Ink v2</h1>
+                    <div id="status" class="flex items-center gap-1.5 text-[9px] font-bold text-slate-500 uppercase tracking-widest">
+                        <span class="w-1.5 h-1.5 bg-green-500 rounded-full"></span>
+                        Ready
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-6">
+                <div class="flex flex-col gap-0.5">
+                    <label class="text-[9px] font-bold text-slate-400 uppercase">Smooth Power</label>
+                    <div class="flex items-center gap-3">
+                        <input type="range" id="smoothFactor" min="0" max="6" step="0.1" value="2.0" class="w-24 accent-slate-900">
+                        <span id="smoothVal" class="text-xs font-mono font-bold text-slate-700 w-6">2.0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-2">
+                <button id="undoBtn" class="p-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-lg transition-all active:scale-95">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
+                </button>
+                <button id="clearBtn" class="px-3 py-2 text-rose-500 hover:bg-rose-50 text-xs font-bold rounded-lg transition-all">Clear</button>
+                <button id="saveBtn" class="px-4 py-2 bg-slate-900 hover:bg-black text-white rounded-lg transition-all font-bold text-xs shadow-md active:scale-95">Export</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="canvasParent" class="flex-grow bg-white relative overflow-hidden">
+        <canvas id="mainCanvas"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('mainCanvas');
+        const ctx = canvas.getContext('2d');
+        const parent = document.getElementById('canvasParent');
+        const smoothSlider = document.getElementById('smoothFactor');
+        const smoothValDisp = document.getElementById('smoothVal');
+        const statusBadge = document.getElementById('status');
+
+        let isDrawing = false;
+        let allPaths = []; // 確定済みのパス
+        let animatingPaths = []; // 現在補正アニメーション中のパス
+        let currentRawPoints = []; // 今書いている最中のパス
+        const STROKE_COLOR = '#0f172a'; // 濃いスレート黒
+
+        function setupCanvas() {
+            const dpr = window.devicePixelRatio || 1;
+            const rect = parent.getBoundingClientRect();
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            canvas.style.width = rect.width + 'px';
+            canvas.style.height = rect.height + 'px';
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+        }
+
+        window.addEventListener('resize', setupCanvas);
+        setupCanvas();
+
+        smoothSlider.oninput = () => smoothValDisp.textContent = smoothSlider.value;
+
+        canvas.addEventListener('pointerdown', (e) => {
+            isDrawing = true;
+            canvas.setPointerCapture(e.pointerId);
+            const pos = getPos(e);
+            currentRawPoints = [pos];
+            statusBadge.innerHTML = '<span class="w-1.5 h-1.5 bg-orange-500 rounded-full animate-pulse"></span> Writing...';
+        });
+
+        canvas.addEventListener('pointermove', (e) => {
+            if (!isDrawing) return;
+            const pos = getPos(e);
+            const last = currentRawPoints[currentRawPoints.length - 1];
+            // 入力密度の最適化（ジッター防止）
+            if (Math.hypot(pos.x - last.x, pos.y - last.y) > 1.5) {
+                currentRawPoints.push(pos);
+            }
+        });
+
+        canvas.addEventListener('pointerup', () => {
+            if (!isDrawing) return;
+            isDrawing = false;
+
+            if (currentRawPoints.length > 1) {
+                const tolerance = parseFloat(smoothSlider.value);
+                const simplified = simplifyPath(currentRawPoints, tolerance);
+                startMorphing(currentRawPoints, simplified);
+            }
+            
+            currentRawPoints = [];
+            if (animatingPaths.length === 0) {
+                statusBadge.innerHTML = '<span class="w-1.5 h-1.5 bg-green-500 rounded-full"></span> Ready';
+            }
+        });
+
+        function getPos(e) {
+            const rect = canvas.getBoundingClientRect();
+            return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        }
+
+        // Ramer-Douglas-Peucker 
+        function simplifyPath(points, tolerance) {
+            if (points.length <= 4) return points;
+
+            function getSqSegDist(p, p1, p2) {
+                let x = p1.x, y = p1.y, dx = p2.x - x, dy = p2.y - y;
+                if (dx !== 0 || dy !== 0) {
+                    let t = ((p.x - x) * dx + (p.y - y) * dy) / (dx * dx + dy * dy);
+                    if (t > 1) { x = p2.x; y = p2.y; }
+                    else if (t > 0) { x += dx * t; y += dy * t; }
+                }
+                dx = p.x - x; dy = p.y - y;
+                return dx * dx + dy * dy;
+            }
+
+            function simplifyStep(points, first, last, sqTolerance, simplified) {
+                let maxSqDist = sqTolerance, index;
+                for (let i = first + 1; i < last; i++) {
+                    let sqDist = getSqSegDist(points[i], points[first], points[last]);
+                    if (sqDist > maxSqDist) {
+                        index = i;
+                        maxSqDist = sqDist;
+                    }
+                }
+                if (maxSqDist > sqTolerance) {
+                    if (index - first > 1) simplifyStep(points, first, index, sqTolerance, simplified);
+                    simplified.push(points[index]);
+                    if (last - index > 1) simplifyStep(points, index, last, sqTolerance, simplified);
+                }
+            }
+
+            let sqTolerance = tolerance * tolerance;
+            let simplified = [points[0]];
+            simplifyStep(points, 0, points.length - 1, sqTolerance, simplified);
+            simplified.push(points[points.length - 1]);
+            return simplified;
+        }
+
+        function startMorphing(raw, smooth) {
+            // 文字の細部を壊さないよう、サンプリング数を多めに確保（文字の角を維持）
+            const count = Math.max(raw.length, 40); 
+            const from = resample(raw, count);
+            const to = resample(smooth, count);
+
+            animatingPaths.push({
+                from: from,
+                to: to,
+                current: JSON.parse(JSON.stringify(from)),
+                startTime: Date.now(),
+                duration: 180 // 文字書き用に高速(0.18秒)
+            });
+        }
+
+        function resample(points, count) {
+            if (points.length < 2) return Array(count).fill(points[0] || {x:0,y:0});
+            let totalDist = 0;
+            for (let i = 0; i < points.length - 1; i++) {
+                totalDist += Math.hypot(points[i+1].x - points[i].x, points[i+1].y - points[i].y);
+            }
+
+            const resampled = [points[0]];
+            const step = totalDist / (count - 1);
+            let currentDist = 0;
+            let pIdx = 0;
+
+            for (let i = 1; i < count - 1; i++) {
+                const targetDist = i * step;
+                while (pIdx < points.length - 1) {
+                    const segmentDist = Math.hypot(points[pIdx+1].x - points[pIdx].x, points[pIdx+1].y - points[pIdx].y);
+                    if (currentDist + segmentDist >= targetDist) {
+                        const t = (targetDist - currentDist) / segmentDist;
+                        resampled.push({
+                            x: points[pIdx].x + (points[pIdx+1].x - points[pIdx].x) * t,
+                            y: points[pIdx].y + (points[pIdx+1].y - points[pIdx].y) * t
+                        });
+                        break;
+                    }
+                    currentDist += segmentDist;
+                    pIdx++;
+                }
+            }
+            if (resampled.length < count) resampled.push(points[points.length - 1]);
+            return resampled;
+        }
+
+        function update() {
+            const now = Date.now();
+            
+            // 補正アニメーションの更新（複数を並行処理）
+            for (let i = animatingPaths.length - 1; i >= 0; i--) {
+                const p = animatingPaths[i];
+                const elapsed = now - p.startTime;
+                const progress = Math.min(elapsed / p.duration, 1);
+                
+                // 強めのイージングでヌルッと感を出す
+                const ease = 1 - Math.pow(1 - progress, 3);
+
+                p.current.forEach((pt, idx) => {
+                    if (p.to[idx]) {
+                        pt.x = p.from[idx].x + (p.to[idx].x - p.from[idx].x) * ease;
+                        pt.y = p.from[idx].y + (p.to[idx].y - p.from[idx].y) * ease;
+                    }
+                });
+
+                if (progress >= 1) {
+                    allPaths.push({ points: p.to });
+                    animatingPaths.splice(i, 1);
+                    if (animatingPaths.length === 0 && !isDrawing) {
+                        statusBadge.innerHTML = '<span class="w-1.5 h-1.5 bg-green-500 rounded-full"></span> Ready';
+                    }
+                }
+            }
+
+            render();
+            requestAnimationFrame(update);
+        }
+
+        function render() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.lineWidth = 2.5;
+            ctx.strokeStyle = STROKE_COLOR;
+
+            // 1. 確定済みの線を一気に描画
+            allPaths.forEach(path => drawPath(path.points, 1.0));
+
+            // 2. 補正中の線を並行して描画
+            animatingPaths.forEach(path => drawPath(path.current, 0.9));
+
+            // 3. 今書いている生データを最前面に描画（ラグなし）
+            if (isDrawing && currentRawPoints.length > 0) {
+                drawPath(currentRawPoints, 0.6);
+            }
+        }
+
+        function drawPath(p, opacity) {
+            if (p.length < 2) return;
+            ctx.globalAlpha = opacity;
+            ctx.beginPath();
+            ctx.moveTo(p[0].x, p[0].y);
+
+            if (p.length < 3) {
+                ctx.lineTo(p[p.length-1].x, p[p.length-1].y);
+            } else {
+                for (let i = 1; i < p.length - 2; i++) {
+                    const xc = (p[i].x + p[i + 1].x) / 2;
+                    const yc = (p[i].y + p[i + 1].y) / 2;
+                    ctx.quadraticCurveTo(p[i].x, p[i].y, xc, yc);
+                }
+                ctx.quadraticCurveTo(p[p.length - 2].x, p[p.length - 2].y, p[p.length - 1].x, p[p.length - 1].y);
+            }
+            ctx.stroke();
+            ctx.globalAlpha = 1.0;
+        }
+
+        document.getElementById('undoBtn').onclick = () => { allPaths.pop(); };
+        document.getElementById('clearBtn').onclick = () => { allPaths = []; animatingPaths = []; };
+        document.getElementById('saveBtn').onclick = () => {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = canvas.width; tempCanvas.height = canvas.height;
+            const tCtx = tempCanvas.getContext('2d');
+            tCtx.fillStyle = 'white'; tCtx.fillRect(0,0,tempCanvas.width, tempCanvas.height);
+            tCtx.drawImage(canvas, 0, 0);
+            const link = document.createElement('a');
+            link.download = 'handwriting_export.png';
+            link.href = tempCanvas.toDataURL(); link.click();
+        };
+
+        requestAnimationFrame(update);
+    </script>
+</body>
+</html>
